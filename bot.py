@@ -34,6 +34,8 @@ OWNER_ID = int(os.getenv("OWNER_ID", "0"))   # Your Telegram user ID for withdra
 
 MIN_WITHDRAW_USD = 1.0   # Minimum balance to request withdrawal
 
+HINT = "\n\n🎙 _Отправь голосовое или кружок — расшифрую!_"
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
@@ -95,7 +97,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Отправь мне голосовое сообщение или аудиофайл — я расшифрую его в текст.\n\n"
         "🎙 Поддерживаю русский и английский язык.\n"
         "📎 Работаю с: голосовыми, аудио и видео-кружками.\n\n"
-        + status_line,
+        + status_line + HINT,
         parse_mode="Markdown",
         reply_markup=MAIN_KEYBOARD,
     )
@@ -126,7 +128,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
 
     await update.message.reply_text(
-        "📊 *Твой статус:*\n\n" + plan_text + "\n\nХочешь больше? /upgrade 👇",
+        "📊 *Твой статус:*\n\n" + plan_text + "\n\nХочешь больше? /upgrade 👇" + HINT,
         parse_mode="Markdown",
         reply_markup=MAIN_KEYBOARD,
     )
@@ -165,7 +167,7 @@ async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         [InlineKeyboardButton("⭐ Тарифы и оплата",  callback_data="show_upgrade")],
     ])
     await update.message.reply_text(
-        "⚙️ *Настройки*\n\nВыбери раздел:",
+        "⚙️ *Настройки*\n\nВыбери раздел:" + HINT,
         parse_mode="Markdown",
         reply_markup=keyboard,
     )
@@ -218,11 +220,17 @@ async def _send_partner_info(message, user_id: int) -> None:
 
 async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
     user = update.effective_user
 
     if query.data == "partner_info":
-        await _send_partner_info(query.message, user.id)
+        await query.answer()
+        try:
+            await _send_partner_info(query.message, user.id)
+        except Exception as e:
+            logger.error(f"partner_info error for user={user.id}: {e}")
+            await query.message.reply_text(
+                "⚠️ Не удалось загрузить данные партнёрской программы. Попробуй ещё раз."
+            )
 
     elif query.data == "partner_withdraw":
         stats = await db.get_partner_stats(user.id)
@@ -233,6 +241,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 show_alert=True,
             )
             return
+        await query.answer()
         # Notify owner
         if OWNER_ID:
             username = f"@{user.username}" if user.username else f"id{user.id}"
@@ -257,6 +266,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
 
     elif query.data == "show_status":
+        await query.answer()
         s = await db.get_user_status(user.id)
         if s["is_pro"] and s["pro_until"]:
             from datetime import datetime
@@ -280,6 +290,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
 
     elif query.data == "show_upgrade":
+        await query.answer()
         keyboard = payments.build_upgrade_keyboard(has_cryptobot=bool(CRYPTO_BOT_TOKEN))
         await query.message.reply_text(
             "💎 *Выбери тариф:*\n\n"
