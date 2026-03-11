@@ -30,6 +30,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 CRYPTO_BOT_TOKEN = os.getenv("CRYPTO_BOT_TOKEN", "")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "voice_to_text_in_tg_bot")
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))   # Your Telegram user ID for withdrawal notifications
+
+MIN_WITHDRAW_USD = 1.0   # Minimum balance to request withdrawal
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -180,19 +183,35 @@ async def _send_partner_info(message, user_id: int) -> None:
     stats = await db.get_partner_stats(user_id)
     ref_link = f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}"
 
-    await message.reply_text(
+    balance = stats["balance"]
+    total_earned = stats["total_earned"]
+
+    text = (
         "🤝 *Партнёрская программа*\n\n"
-        "Приглашай друзей — получай минуты за каждую их покупку!\n\n"
+        "Приглашай друзей — получай 35% с каждой их покупки!\n\n"
         f"🔗 *Твоя реферальная ссылка:*\n`{ref_link}`\n\n"
         "💰 *Твой бонус (35%) с каждой покупки реферала:*\n"
-        "   • Купит Pro ($3) → тебе *+63 мин*\n"
-        "   • Купит 60 мин ($1) → тебе *+21 мин*\n"
-        "   • Купит 300 мин ($2.50) → тебе *+105 мин*\n\n"
+        "   • Pro ($3) → *+$1.05*\n"
+        "   • 60 мин ($1) → *+$0.35*\n"
+        "   • 300 мин ($2.50) → *+$0.88*\n\n"
         f"👥 Приглашено: *{stats['referrals']} чел.*\n"
-        f"🎁 Заработано всего: *{stats['earned_minutes']} мин*",
-        parse_mode="Markdown",
-        reply_markup=MAIN_KEYBOARD,
+        f"💵 Баланс к выводу: *${balance:.2f}*\n"
+        f"📈 Заработано всего: *${total_earned:.2f}*"
     )
+
+    if balance >= MIN_WITHDRAW_USD:
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                f"💸 Запросить вывод (${balance:.2f})",
+                callback_data="partner_withdraw",
+            )
+        ]])
+        await message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+    else:
+        await message.reply_text(
+            text + f"\n\n_Минимальная сумма для вывода: ${MIN_WITHDRAW_USD:.2f}_",
+            parse_mode="Markdown",
+        )
 
 
 # ─── Inline settings / partner callbacks ─────────────────────────────────────
@@ -203,20 +222,38 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     user = update.effective_user
 
     if query.data == "partner_info":
+        await _send_partner_info(query.message, user.id)
+
+    elif query.data == "partner_withdraw":
         stats = await db.get_partner_stats(user.id)
-        ref_link = f"https://t.me/{BOT_USERNAME}?start=ref_{user.id}"
+        balance = stats["balance"]
+        if balance < MIN_WITHDRAW_USD:
+            await query.answer(
+                f"Минимальная сумма для вывода: ${MIN_WITHDRAW_USD:.2f}",
+                show_alert=True,
+            )
+            return
+        # Notify owner
+        if OWNER_ID:
+            username = f"@{user.username}" if user.username else f"id{user.id}"
+            try:
+                await context.bot.send_message(
+                    chat_id=OWNER_ID,
+                    text=(
+                        f"💸 *Запрос на вывод!*\n\n"
+                        f"Партнёр: {username} (id: `{user.id}`)\n"
+                        f"Сумма: *${balance:.2f}*"
+                    ),
+                    parse_mode="Markdown",
+                )
+            except Exception as e:
+                logger.error(f"Failed to notify owner about withdrawal: {e}")
+        # Zero out the balance
+        await db.reset_partner_balance(user.id)
         await query.message.reply_text(
-            "🤝 *Партнёрская программа*\n\n"
-            "Приглашай друзей — получай минуты за каждую их покупку!\n\n"
-            f"🔗 *Твоя реферальная ссылка:*\n`{ref_link}`\n\n"
-            "💰 *Твой бонус (35%) с каждой покупки реферала:*\n"
-            "   • Купит Pro ($3) → тебе *+63 мин*\n"
-            "   • Купит 60 мин ($1) → тебе *+21 мин*\n"
-            "   • Купит 300 мин ($2.50) → тебе *+52 мин*\n\n"
-            f"👥 Приглашено: *{stats['referrals']} чел.*\n"
-            f"🎁 Заработано всего: *{stats['earned_minutes']} мин*",
+            f"✅ *Запрос на вывод ${balance:.2f} отправлен!*\n\n"
+            "Ожидай перевод в ближайшее время.",
             parse_mode="Markdown",
-            reply_markup=MAIN_KEYBOARD,
         )
 
     elif query.data == "show_status":
@@ -477,7 +514,7 @@ def main() -> None:
     # Inline callbacks: settings/partner
     app.add_handler(CallbackQueryHandler(
         settings_callback,
-        pattern=r"^(partner_info|show_status|show_upgrade)$"
+        pattern=r"^(partner_info|partner_withdraw|show_status|show_upgrade)$"
     ))
     # Inline callbacks: buy
     app.add_handler(CallbackQueryHandler(
