@@ -19,7 +19,9 @@ async def init_db():
                 pro_until            DATETIME,
                 credits              INTEGER  DEFAULT 0,
                 referred_by          INTEGER  DEFAULT NULL,
-                partner_earned_min   INTEGER  DEFAULT 0
+                partner_earned_min   INTEGER  DEFAULT 0,
+                partner_balance      REAL     DEFAULT 0.0,
+                partner_total_earned REAL     DEFAULT 0.0
             );
 
             CREATE TABLE IF NOT EXISTS daily_usage (
@@ -52,6 +54,8 @@ async def init_db():
             "ALTER TABLE daily_usage ADD COLUMN seconds INTEGER DEFAULT 0",
             "ALTER TABLE users ADD COLUMN referred_by INTEGER DEFAULT NULL",
             "ALTER TABLE users ADD COLUMN partner_earned_min INTEGER DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN partner_balance REAL DEFAULT 0.0",
+            "ALTER TABLE users ADD COLUMN partner_total_earned REAL DEFAULT 0.0",
         ]:
             try:
                 await db.execute(migration)
@@ -92,32 +96,48 @@ async def get_referrer(user_id: int) -> int | None:
     return row[0] if row and row[0] else None
 
 
-async def add_partner_bonus(referrer_id: int, bonus_minutes: int):
-    """Credit bonus minutes to partner and record total earned."""
+async def add_partner_earnings(referrer_id: int, usd_amount: float):
+    """Credit USD earnings to partner balance and lifetime total."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """UPDATE users
-               SET credits = credits + ?,
-                   partner_earned_min = partner_earned_min + ?
+               SET partner_balance      = partner_balance + ?,
+                   partner_total_earned = partner_total_earned + ?
                WHERE user_id = ?""",
-            (bonus_minutes * 60, bonus_minutes, referrer_id)
+            (usd_amount, usd_amount, referrer_id)
+        )
+        await db.commit()
+
+
+async def reset_partner_balance(user_id: int):
+    """Zero out the withdrawable balance after payout."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET partner_balance = 0.0 WHERE user_id = ?",
+            (user_id,)
         )
         await db.commit()
 
 
 async def get_partner_stats(user_id: int) -> dict:
-    """Return how many users this person referred and total minutes earned as partner."""
+    """Return referral count, current balance (USD), and lifetime earned (USD)."""
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             "SELECT COUNT(*) FROM users WHERE referred_by = ?", (user_id,)
         ) as cur:
             ref_count = (await cur.fetchone())[0]
         async with db.execute(
-            "SELECT partner_earned_min FROM users WHERE user_id = ?", (user_id,)
+            "SELECT partner_balance, partner_total_earned FROM users WHERE user_id = ?",
+            (user_id,)
         ) as cur:
             row = await cur.fetchone()
-        earned = row[0] if row else 0
-    return {"referrals": ref_count, "earned_minutes": earned}
+    balance       = round(row[0], 2) if row else 0.0
+    total_earned  = round(row[1], 2) if row else 0.0
+    return {
+        "referrals":     ref_count,
+        "balance":       balance,
+        "total_earned":  total_earned,
+    }
 
 
 async def check_access(user_id: int, duration_sec: int = 0) -> tuple:

@@ -20,7 +20,7 @@ PLANS = {
         "usdt": "3.00",
         "minutes": None,
         "days": 30,
-        "partner_bonus_min": 63,   # 35% of $3 ≈ $1.05 → ~63 min
+        "partner_bonus_usd": 1.05,   # 35% of $3.00
     },
     "m60": {
         "title": "🎯 Минуты +60 (не сгорают)",
@@ -29,7 +29,7 @@ PLANS = {
         "usdt": "1.00",
         "minutes": 60,
         "days": None,
-        "partner_bonus_min": 21,   # 35% of 60 min
+        "partner_bonus_usd": 0.35,   # 35% of $1.00
     },
     "m300": {
         "title": "🚀 Минуты +300 (не сгорают)",
@@ -38,7 +38,7 @@ PLANS = {
         "usdt": "2.50",
         "minutes": 300,
         "days": None,
-        "partner_bonus_min": 52,   # 35% of $2.50 → $0.875 → ~52 min
+        "partner_bonus_usd": 0.875,  # 35% of $2.50
     },
 }
 
@@ -109,21 +109,8 @@ async def handle_successful_payment(update, context):
             parse_mode="Markdown",
         )
 
-    # ── Partner bonus (35%) ──
-    referrer_id = await db.get_referrer(user_id)
-    if referrer_id:
-        bonus = plan.get("partner_bonus_min", 0)
-        if bonus > 0:
-            await db.add_partner_bonus(referrer_id, bonus)
-            try:
-                await context.bot.send_message(
-                    chat_id=referrer_id,
-                    text=f"🤝 *Партнёрский бонус!*\n\n"
-                         f"Твой реферал совершил покупку — тебе начислено *+{bonus} мин* 🎙",
-                    parse_mode="Markdown",
-                )
-            except Exception:
-                pass
+    # ── Partner bonus (35% в USD) ──
+    await _credit_partner(context.bot, user_id, plan)
 
 
 # ─── CryptoBot ───────────────────────────────────────────────────────────────
@@ -227,20 +214,29 @@ async def check_crypto_invoices(context):
         except Exception as e:
             logger.error(f"Failed to notify user {user_id}: {e}")
 
-        # ── Partner bonus (35%) ──
-        referrer_id = await db.get_referrer(user_id)
-        if referrer_id:
-            bonus = plan.get("partner_bonus_min", 0)
-            if bonus > 0:
-                await db.add_partner_bonus(referrer_id, bonus)
-                try:
-                    await context.bot.send_message(
-                        chat_id=referrer_id,
-                        text=f"🤝 *Партнёрский бонус!*\n\n"
-                             f"Твой реферал совершил покупку — тебе начислено *+{bonus} мин* 🎙",
-                        parse_mode="Markdown",
-                    )
-                except Exception:
-                    pass
+        # ── Partner bonus (35% в USD) ──
+        await _credit_partner(context.bot, user_id, plan)
 
         await db.delete_pending_invoice(invoice_id)
+
+
+# ─── Partner bonus helper ────────────────────────────────────────────────────
+
+async def _credit_partner(bot, buyer_id: int, plan: dict):
+    """Credit 35% USD bonus to referrer and notify them."""
+    referrer_id = await db.get_referrer(buyer_id)
+    if not referrer_id:
+        return
+    bonus_usd = plan.get("partner_bonus_usd", 0.0)
+    if bonus_usd <= 0:
+        return
+    await db.add_partner_earnings(referrer_id, bonus_usd)
+    try:
+        await bot.send_message(
+            chat_id=referrer_id,
+            text=f"🤝 *Партнёрский бонус!*\n\n"
+                 f"Твой реферал совершил покупку — тебе начислено *+${bonus_usd:.2f}* 💰",
+            parse_mode="Markdown",
+        )
+    except Exception:
+        pass
