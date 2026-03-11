@@ -1,4 +1,5 @@
 import os
+import html
 import logging
 import tempfile
 from dotenv import load_dotenv
@@ -22,11 +23,10 @@ groq_client = Groq(api_key=GROQ_API_KEY)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "👋 Привет! Я *Father Bot Talking*.\n\n"
-        "Отправь мне голосовое сообщение или аудиофайл, и я расшифрую его в текст.\n\n"
+        "👋 Привет!\n\n"
+        "Отправь мне голосовое сообщение или аудиофайл — я расшифрую его в текст.\n\n"
         "🎙 Поддерживаю русский и английский язык.\n"
-        "📎 Работаю с: голосовыми, аудио и видео-кружками.",
-        parse_mode="Markdown"
+        "📎 Работаю с: голосовыми, аудио и видео-кружками."
     )
 
 
@@ -69,24 +69,28 @@ async def transcribe_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await status_msg.edit_text("🤷 Не удалось распознать речь. Попробуй ещё раз.")
             return
 
-        logger.info(f"Transcribed message from user {message.from_user.id}: {len(text)} chars")
+        logger.info(f"Transcribed {len(text)} chars from user {message.from_user.id}")
 
-        # Telegram limit is 4096 chars; split if needed
-        MAX_LEN = 4096
-        header = "📝 "
+        # Escape HTML, wrap in <code> — gives copy-on-tap button in Telegram
+        escaped = html.escape(text)
+        OPEN, CLOSE = "<code>", "</code>"
+        TAG_LEN = len(OPEN) + len(CLOSE)
+        header = "📝 Расшифровка:\n\n"
+
         chunks = []
-        remaining = text
+        remaining = escaped
         first = True
         while remaining:
             prefix = header if first else ""
-            available = MAX_LEN - len(prefix)
-            chunks.append(prefix + remaining[:available])
+            available = 4096 - len(prefix) - TAG_LEN
+            chunk = remaining[:available]
+            chunks.append(prefix + OPEN + chunk + CLOSE)
             remaining = remaining[available:]
             first = False
 
-        await status_msg.edit_text(chunks[0])
+        await status_msg.edit_text(chunks[0], parse_mode="HTML")
         for chunk in chunks[1:]:
-            await message.reply_text(chunk)
+            await message.reply_text(chunk, parse_mode="HTML")
 
     except Exception as e:
         logger.error(f"Transcription error: {e}")
@@ -114,7 +118,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.AUDIO, transcribe_voice))
     app.add_handler(MessageHandler(filters.VIDEO_NOTE, transcribe_voice))
 
-    logger.info("Father Bot Talking запущен...")
+    logger.info("Bot started")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
