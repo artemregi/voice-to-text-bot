@@ -4,7 +4,13 @@ import logging
 import tempfile
 from dotenv import load_dotenv
 from groq import Groq
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import (
+    Update,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -23,6 +29,7 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 CRYPTO_BOT_TOKEN = os.getenv("CRYPTO_BOT_TOKEN", "")
+BOT_USERNAME = os.getenv("BOT_USERNAME", "voice_to_text_in_tg_bot")
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -31,6 +38,18 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 groq_client = Groq(api_key=GROQ_API_KEY)
+
+# ─── Persistent bottom keyboard ──────────────────────────────────────────────
+
+MAIN_KEYBOARD = ReplyKeyboardMarkup(
+    [[
+        KeyboardButton("📊 Статус"),
+        KeyboardButton("⭐ Тарифы"),
+        KeyboardButton("⚙️ Настройки"),
+    ]],
+    resize_keyboard=True,
+    is_persistent=True,
+)
 
 
 def fmt_sec(s: int) -> str:
@@ -43,6 +62,16 @@ def fmt_sec(s: int) -> str:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     await db.get_or_create_user(user.id, user.username)
+
+    # Handle referral deep link: /start ref_12345
+    if context.args:
+        arg = context.args[0]
+        if arg.startswith("ref_"):
+            try:
+                referrer_id = int(arg[4:])
+                await db.set_referral(user.id, referrer_id)
+            except ValueError:
+                pass
 
     s = await db.get_user_status(user.id)
 
@@ -65,10 +94,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "📎 Работаю с: голосовыми, аудио и видео-кружками.\n\n"
         + status_line,
         parse_mode="Markdown",
+        reply_markup=MAIN_KEYBOARD,
     )
 
 
-# ─── /status ─────────────────────────────────────────────────────────────────
+# ─── /status (и кнопка 📊 Статус) ────────────────────────────────────────────
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
@@ -95,10 +125,11 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(
         "📊 *Твой статус:*\n\n" + plan_text + "\n\nХочешь больше? /upgrade 👇",
         parse_mode="Markdown",
+        reply_markup=MAIN_KEYBOARD,
     )
 
 
-# ─── /upgrade ────────────────────────────────────────────────────────────────
+# ─── /upgrade (и кнопка ⭐ Тарифы) ───────────────────────────────────────────
 
 async def upgrade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
@@ -117,6 +148,114 @@ async def upgrade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         parse_mode="Markdown",
         reply_markup=keyboard,
     )
+
+
+# ─── /settings (и кнопка ⚙️ Настройки) ──────────────────────────────────────
+
+async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    await db.get_or_create_user(user.id, user.username)
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🤝 Стать партнёром", callback_data="partner_info")],
+        [InlineKeyboardButton("📊 Мой статус",       callback_data="show_status")],
+        [InlineKeyboardButton("⭐ Тарифы и оплата",  callback_data="show_upgrade")],
+    ])
+    await update.message.reply_text(
+        "⚙️ *Настройки*\n\nВыбери раздел:",
+        parse_mode="Markdown",
+        reply_markup=keyboard,
+    )
+
+
+# ─── /partner ─────────────────────────────────────────────────────────────────
+
+async def partner_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    await db.get_or_create_user(user.id, user.username)
+    await _send_partner_info(update.message, user.id)
+
+
+async def _send_partner_info(message, user_id: int) -> None:
+    stats = await db.get_partner_stats(user_id)
+    ref_link = f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}"
+
+    await message.reply_text(
+        "🤝 *Партнёрская программа*\n\n"
+        "Приглашай друзей — получай минуты за каждую их покупку!\n\n"
+        f"🔗 *Твоя реферальная ссылка:*\n`{ref_link}`\n\n"
+        "💰 *Твой бонус (35%) с каждой покупки реферала:*\n"
+        "   • Купит Pro ($3) → тебе *+63 мин*\n"
+        "   • Купит 60 мин ($1) → тебе *+21 мин*\n"
+        "   • Купит 300 мин ($2.50) → тебе *+105 мин*\n\n"
+        f"👥 Приглашено: *{stats['referrals']} чел.*\n"
+        f"🎁 Заработано всего: *{stats['earned_minutes']} мин*",
+        parse_mode="Markdown",
+        reply_markup=MAIN_KEYBOARD,
+    )
+
+
+# ─── Inline settings / partner callbacks ─────────────────────────────────────
+
+async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user = update.effective_user
+
+    if query.data == "partner_info":
+        stats = await db.get_partner_stats(user.id)
+        ref_link = f"https://t.me/{BOT_USERNAME}?start=ref_{user.id}"
+        await query.message.reply_text(
+            "🤝 *Партнёрская программа*\n\n"
+            "Приглашай друзей — получай минуты за каждую их покупку!\n\n"
+            f"🔗 *Твоя реферальная ссылка:*\n`{ref_link}`\n\n"
+            "💰 *Твой бонус (35%) с каждой покупки реферала:*\n"
+            "   • Купит Pro ($3) → тебе *+63 мин*\n"
+            "   • Купит 60 мин ($1) → тебе *+21 мин*\n"
+            "   • Купит 300 мин ($2.50) → тебе *+105 мин*\n\n"
+            f"👥 Приглашено: *{stats['referrals']} чел.*\n"
+            f"🎁 Заработано всего: *{stats['earned_minutes']} мин*",
+            parse_mode="Markdown",
+            reply_markup=MAIN_KEYBOARD,
+        )
+
+    elif query.data == "show_status":
+        s = await db.get_user_status(user.id)
+        if s["is_pro"] and s["pro_until"]:
+            from datetime import datetime
+            expiry = datetime.fromisoformat(s["pro_until"])
+            days_left = (expiry - datetime.utcnow()).days
+            plan_text = f"⭐ *Pro-подписка* — осталось {days_left} дн. (до {expiry.strftime('%d.%m.%Y')})"
+        elif s["credits"] > 0:
+            mins = s["credits"] // 60
+            plan_text = f"🎯 Накопленные минуты: *{mins} мин* (не сгорают)"
+        else:
+            used = fmt_sec(s["daily_seconds"])
+            plan_text = (
+                f"🆓 Бесплатный план:\n"
+                f"   ⏱ *{used} из 3:00* минут сегодня\n"
+                f"   🔢 *{s['daily_count']}/10* расшифровок сегодня"
+            )
+        await query.message.reply_text(
+            "📊 *Твой статус:*\n\n" + plan_text,
+            parse_mode="Markdown",
+            reply_markup=MAIN_KEYBOARD,
+        )
+
+    elif query.data == "show_upgrade":
+        keyboard = payments.build_upgrade_keyboard(has_cryptobot=bool(CRYPTO_BOT_TOKEN))
+        await query.message.reply_text(
+            "💎 *Выбери тариф:*\n\n"
+            "⭐ *Pro — 30 дней безлимита*\n"
+            "   $3 · ~$0.10 за расшифровку · в 5× дешевле Otter.ai\n\n"
+            "🎯 *Минуты +60* (не сгорают)\n"
+            "   $1 · хватит на ~2 недели обычного использования\n\n"
+            "🚀 *Минуты +300* (не сгорают)\n"
+            "   $2.50 · или возьми Pro за $3 — разница $0.50, но безлимит\n\n"
+            "Выбери способ оплаты 👇",
+            parse_mode="Markdown",
+            reply_markup=keyboard,
+        )
 
 
 # ─── Transcribe (main handler) ───────────────────────────────────────────────
@@ -323,17 +462,40 @@ def main() -> None:
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(CommandHandler("upgrade", upgrade_cmd))
+    # Commands
+    app.add_handler(CommandHandler("start",    start))
+    app.add_handler(CommandHandler("status",   status_cmd))
+    app.add_handler(CommandHandler("upgrade",  upgrade_cmd))
+    app.add_handler(CommandHandler("settings", settings_cmd))
+    app.add_handler(CommandHandler("partner",  partner_cmd))
 
-    app.add_handler(MessageHandler(filters.VOICE, transcribe_voice))
-    app.add_handler(MessageHandler(filters.AUDIO, transcribe_voice))
-    app.add_handler(MessageHandler(filters.VIDEO_NOTE, transcribe_voice))
+    # Persistent keyboard buttons (text messages matching button labels)
+    app.add_handler(MessageHandler(filters.Regex(r"^📊 Статус$"),      status_cmd))
+    app.add_handler(MessageHandler(filters.Regex(r"^⭐ Тарифы$"),      upgrade_cmd))
+    app.add_handler(MessageHandler(filters.Regex(r"^⚙️ Настройки$"),   settings_cmd))
 
-    app.add_handler(CallbackQueryHandler(buy_callback, pattern=r"^(stars|crypto)_(sub|m60|m300)$"))
+    # Inline callbacks: settings/partner
+    app.add_handler(CallbackQueryHandler(
+        settings_callback,
+        pattern=r"^(partner_info|show_status|show_upgrade)$"
+    ))
+    # Inline callbacks: buy
+    app.add_handler(CallbackQueryHandler(
+        buy_callback,
+        pattern=r"^(stars|crypto)_(sub|m60|m300)$"
+    ))
+
+    # Payments
     app.add_handler(PreCheckoutQueryHandler(pre_checkout))
-    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, payments.handle_successful_payment))
+    app.add_handler(MessageHandler(
+        filters.SUCCESSFUL_PAYMENT, payments.handle_successful_payment
+    ))
+
+    # Audio transcription
+    app.add_handler(MessageHandler(
+        filters.VOICE | filters.AUDIO | filters.VIDEO_NOTE,
+        transcribe_voice
+    ))
 
     if CRYPTO_BOT_TOKEN:
         app.job_queue.run_repeating(payments.check_crypto_invoices, interval=5, first=5)

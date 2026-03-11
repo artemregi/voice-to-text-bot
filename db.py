@@ -12,12 +12,14 @@ async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript("""
             CREATE TABLE IF NOT EXISTS users (
-                user_id     INTEGER PRIMARY KEY,
-                username    TEXT,
-                created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
-                is_pro      BOOLEAN  DEFAULT FALSE,
-                pro_until   DATETIME,
-                credits     INTEGER  DEFAULT 0
+                user_id              INTEGER PRIMARY KEY,
+                username             TEXT,
+                created_at           DATETIME DEFAULT CURRENT_TIMESTAMP,
+                is_pro               BOOLEAN  DEFAULT FALSE,
+                pro_until            DATETIME,
+                credits              INTEGER  DEFAULT 0,
+                referred_by          INTEGER  DEFAULT NULL,
+                partner_earned_min   INTEGER  DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS daily_usage (
@@ -45,12 +47,17 @@ async def init_db():
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
         """)
-        # Migration: add seconds column for existing DBs that only have count
-        try:
-            await db.execute("ALTER TABLE daily_usage ADD COLUMN seconds INTEGER DEFAULT 0")
-            await db.commit()
-        except Exception:
-            pass  # Already exists
+        # Migrations for existing DBs
+        for migration in [
+            "ALTER TABLE daily_usage ADD COLUMN seconds INTEGER DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN referred_by INTEGER DEFAULT NULL",
+            "ALTER TABLE users ADD COLUMN partner_earned_min INTEGER DEFAULT 0",
+        ]:
+            try:
+                await db.execute(migration)
+                await db.commit()
+            except Exception:
+                pass  # Column already exists
         await db.commit()
 
 
@@ -61,6 +68,56 @@ async def get_or_create_user(user_id: int, username: str = None):
             (user_id, username)
         )
         await db.commit()
+
+
+async def set_referral(user_id: int, referrer_id: int):
+    """Set who referred this user. Only set once (first touch)."""
+    if user_id == referrer_id:
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET referred_by = ? WHERE user_id = ? AND referred_by IS NULL",
+            (referrer_id, user_id)
+        )
+        await db.commit()
+
+
+async def get_referrer(user_id: int) -> int | None:
+    """Return referrer's user_id, or None."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT referred_by FROM users WHERE user_id = ?", (user_id,)
+        ) as cur:
+            row = await cur.fetchone()
+    return row[0] if row and row[0] else None
+
+
+async def add_partner_bonus(referrer_id: int, bonus_minutes: int):
+    """Credit bonus minutes to partner and record total earned."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """UPDATE users
+               SET credits = credits + ?,
+                   partner_earned_min = partner_earned_min + ?
+               WHERE user_id = ?""",
+            (bonus_minutes * 60, bonus_minutes, referrer_id)
+        )
+        await db.commit()
+
+
+async def get_partner_stats(user_id: int) -> dict:
+    """Return how many users this person referred and total minutes earned as partner."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM users WHERE referred_by = ?", (user_id,)
+        ) as cur:
+            ref_count = (await cur.fetchone())[0]
+        async with db.execute(
+            "SELECT partner_earned_min FROM users WHERE user_id = ?", (user_id,)
+        ) as cur:
+            row = await cur.fetchone()
+        earned = row[0] if row else 0
+    return {"referrals": ref_count, "earned_minutes": earned}
 
 
 async def check_access(user_id: int, duration_sec: int = 0) -> tuple:

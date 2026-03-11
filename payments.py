@@ -20,6 +20,7 @@ PLANS = {
         "usdt": "3.00",
         "minutes": None,
         "days": 30,
+        "partner_bonus_min": 63,   # 35% of $3 ≈ $1.05 → ~63 min
     },
     "m60": {
         "title": "🎯 Минуты +60 (не сгорают)",
@@ -28,6 +29,7 @@ PLANS = {
         "usdt": "1.00",
         "minutes": 60,
         "days": None,
+        "partner_bonus_min": 21,   # 35% of 60 min
     },
     "m300": {
         "title": "🚀 Минуты +300 (не сгорают)",
@@ -36,6 +38,7 @@ PLANS = {
         "usdt": "2.50",
         "minutes": 300,
         "days": None,
+        "partner_bonus_min": 105,  # 35% of 300 min
     },
 }
 
@@ -105,6 +108,22 @@ async def handle_successful_payment(update, context):
             "Минуты не сгорают — используй когда удобно 🎙",
             parse_mode="Markdown",
         )
+
+    # ── Partner bonus (35%) ──
+    referrer_id = await db.get_referrer(user_id)
+    if referrer_id:
+        bonus = plan.get("partner_bonus_min", 0)
+        if bonus > 0:
+            await db.add_partner_bonus(referrer_id, bonus)
+            try:
+                await context.bot.send_message(
+                    chat_id=referrer_id,
+                    text=f"🤝 *Партнёрский бонус!*\n\n"
+                         f"Твой реферал совершил покупку — тебе начислено *+{bonus} мин* 🎙",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass
 
 
 # ─── CryptoBot ───────────────────────────────────────────────────────────────
@@ -207,5 +226,21 @@ async def check_crypto_invoices(context):
             await context.bot.send_message(chat_id=user_id, text=text, parse_mode="Markdown")
         except Exception as e:
             logger.error(f"Failed to notify user {user_id}: {e}")
+
+        # ── Partner bonus (35%) ──
+        referrer_id = await db.get_referrer(user_id)
+        if referrer_id:
+            bonus = plan.get("partner_bonus_min", 0)
+            if bonus > 0:
+                await db.add_partner_bonus(referrer_id, bonus)
+                try:
+                    await context.bot.send_message(
+                        chat_id=referrer_id,
+                        text=f"🤝 *Партнёрский бонус!*\n\n"
+                             f"Твой реферал совершил покупку — тебе начислено *+{bonus} мин* 🎙",
+                        parse_mode="Markdown",
+                    )
+                except Exception:
+                    pass
 
         await db.delete_pending_invoice(invoice_id)
