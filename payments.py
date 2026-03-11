@@ -15,41 +15,43 @@ CRYPTO_API = "https://pay.crypt.bot/api"
 PLANS = {
     "sub": {
         "title": "⭐ Pro — безлимит 30 дней",
-        "description": "Неограниченные расшифровки голосовых, аудио и видео-кружков.",
-        "stars": 199,
-        "usdt": "2.00",
-        "credits": None,
-        "days": 30,
-    },
-    "c30": {
-        "title": "🎯 Кредиты +30 расшифровок",
-        "description": "Разовое пополнение: +30 расшифровок без подписки.",
-        "stars": 99,
-        "usdt": "1.00",
-        "credits": 30,
-        "days": None,
-    },
-    "c150": {
-        "title": "🚀 Кредиты +150 расшифровок",
-        "description": "Разовое пополнение: +150 расшифровок без подписки.",
+        "description": "Неограниченные расшифровки. В 5× дешевле Otter.ai.",
         "stars": 299,
         "usdt": "3.00",
-        "credits": 150,
+        "minutes": None,
+        "days": 30,
+    },
+    "m60": {
+        "title": "🎯 Минуты +60 (не сгорают)",
+        "description": "+60 минут расшифровок без подписки. Хватит на ~2 недели.",
+        "stars": 99,
+        "usdt": "1.00",
+        "minutes": 60,
+        "days": None,
+    },
+    "m300": {
+        "title": "🚀 Минуты +300 (не сгорают)",
+        "description": "+300 минут расшифровок. Или возьми Pro — разница всего $0.50.",
+        "stars": 249,
+        "usdt": "2.50",
+        "minutes": 300,
         "days": None,
     },
 }
 
 
-# ─── Upgrade keyboard (shown when limit hit or on /upgrade) ─────────────────
+# ─── Upgrade keyboard ────────────────────────────────────────────────────────
 
 def build_upgrade_keyboard(has_cryptobot: bool) -> InlineKeyboardMarkup:
     rows = []
     for plan_key, plan in PLANS.items():
-        stars_label = f"⭐ {plan['stars']} Stars"
-        stars_btn = InlineKeyboardButton(stars_label, callback_data=f"stars_{plan_key}")
+        stars_btn = InlineKeyboardButton(
+            f"⭐ {plan['stars']} Stars", callback_data=f"stars_{plan_key}"
+        )
         if has_cryptobot:
-            crypto_label = f"💰 {plan['usdt']} USDT"
-            crypto_btn = InlineKeyboardButton(crypto_label, callback_data=f"crypto_{plan_key}")
+            crypto_btn = InlineKeyboardButton(
+                f"💰 {plan['usdt']} USDT", callback_data=f"crypto_{plan_key}"
+            )
             rows.append([stars_btn, crypto_btn])
         else:
             rows.append([stars_btn])
@@ -73,7 +75,7 @@ async def send_stars_invoice(bot, chat_id: int, plan_key: str):
 async def handle_successful_payment(update, context):
     payment = update.message.successful_payment
     user_id = update.effective_user.id
-    payload = payment.invoice_payload  # e.g. "stars_sub"
+    payload = payment.invoice_payload  # e.g. "stars_sub", "stars_m60"
 
     plan_key = payload.replace("stars_", "")
     plan = PLANS.get(plan_key)
@@ -93,14 +95,14 @@ async def handle_successful_payment(update, context):
         await db.activate_pro(user_id, days=plan["days"])
         await update.message.reply_text(
             f"✅ *Pro активирован* на {plan['days']} дней!\n\n"
-            "Расшифровывай голосовые без ограничений 🎙",
+            "Расшифровывай без ограничений 🎙",
             parse_mode="Markdown",
         )
     else:
-        await db.add_credits(user_id, plan["credits"])
+        await db.add_minutes(user_id, plan["minutes"])
         await update.message.reply_text(
-            f"✅ *+{plan['credits']} расшифровок* добавлено!\n\n"
-            "Используй их когда удобно 🎙",
+            f"✅ *+{plan['minutes']} минут* добавлено!\n\n"
+            "Минуты не сгорают — используй когда удобно 🎙",
             parse_mode="Markdown",
         )
 
@@ -171,11 +173,10 @@ async def check_crypto_invoices(context):
         if inv["status"] != "paid":
             continue
         invoice_id = inv["invoice_id"]
-        # find matching pending row
         row = next((r for r in pending if r[0] == invoice_id), None)
         if not row:
             continue
-        _, user_id, plan_payload = row  # plan_payload = "crypto_sub" / "crypto_c30" etc.
+        _, user_id, plan_payload = row  # e.g. "crypto_sub", "crypto_m60"
         plan_key = plan_payload.replace("crypto_", "")
         plan = PLANS.get(plan_key)
         if not plan:
@@ -193,13 +194,13 @@ async def check_crypto_invoices(context):
             await db.activate_pro(user_id, days=plan["days"])
             text = (
                 f"✅ *Pro активирован* на {plan['days']} дней!\n\n"
-                "Расшифровывай голосовые без ограничений 🎙"
+                "Расшифровывай без ограничений 🎙"
             )
         else:
-            await db.add_credits(user_id, plan["credits"])
+            await db.add_minutes(user_id, plan["minutes"])
             text = (
-                f"✅ *+{plan['credits']} расшифровок* добавлено!\n\n"
-                "Используй их когда удобно 🎙"
+                f"✅ *+{plan['minutes']} минут* добавлено!\n\n"
+                "Минуты не сгорают — используй когда удобно 🎙"
             )
 
         try:

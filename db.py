@@ -4,6 +4,9 @@ from datetime import datetime, date, timedelta
 
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 
+FREE_DAILY_LIMIT = int(os.getenv("FREE_DAILY_LIMIT", "10"))
+FREE_DAILY_SECONDS = int(os.getenv("FREE_DAILY_SECONDS", "180"))
+
 
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
@@ -21,26 +24,33 @@ async def init_db():
                 user_id  INTEGER,
                 date     DATE,
                 count    INTEGER DEFAULT 0,
+                seconds  INTEGER DEFAULT 0,
                 PRIMARY KEY (user_id, date)
             );
 
             CREATE TABLE IF NOT EXISTS payments (
-                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id            INTEGER,
-                charge_id          TEXT UNIQUE,
-                amount             TEXT,
-                currency           TEXT,
-                type               TEXT,
-                created_at         DATETIME DEFAULT CURRENT_TIMESTAMP
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    INTEGER,
+                charge_id  TEXT UNIQUE,
+                amount     TEXT,
+                currency   TEXT,
+                type       TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
 
             CREATE TABLE IF NOT EXISTS pending_payments (
-                invoice_id   INTEGER PRIMARY KEY,
-                user_id      INTEGER,
-                payload      TEXT,
-                created_at   DATETIME DEFAULT CURRENT_TIMESTAMP
+                invoice_id INTEGER PRIMARY KEY,
+                user_id    INTEGER,
+                payload    TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
         """)
+        # Migration: add seconds column for existing DBs that only have count
+        try:
+            await db.execute("ALTER TABLE daily_usage ADD COLUMN seconds INTEGER DEFAULT 0")
+            await db.commit()
+        except Exception:
+            pass  # Already exists
         await db.commit()
 
 
@@ -53,16 +63,18 @@ async def get_or_create_user(user_id: int, username: str = None):
         await db.commit()
 
 
-FREE_DAILY_LIMIT = int(os.getenv("FREE_DAILY_LIMIT", "10"))
-
-
-async def check_access(user_id: int) -> str:
+async def check_access(user_id: int, duration_sec: int = 0) -> tuple:
     """
-    Returns: 'pro' | 'credits' | 'free_ok' | 'limit'
+    Returns (access_type, remaining_free_seconds):
+      ("pro", 0)      — unlimited pro subscription
+      ("credits", 0)  — has paid minute credits, transcribe fully
+      ("free_ok", N)  — within free limits, N free seconds remain today
+      ("partial", N)  — N free seconds remain but duration > N (soft wall)
+      ("limit", 0)    — both free limits exhausted
     """
     today = date.today().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
-        # Check pro subscription
+        # Pro check
         async with db.execute(
             "SELECT is_pro, pro_until FROM users WHERE user_id = ?", (user_id,)
         ) as cur:
@@ -70,50 +82,71 @@ async def check_access(user_id: int) -> str:
         if row:
             is_pro, pro_until = row
             if is_pro and pro_until:
-                expiry = datetime.fromisoformat(pro_until)
-                if expiry > datetime.utcnow():
-                    return "pro"
+                if datetime.fromisoformat(pro_until) > datetime.utcnow():
+                    return ("pro", 0)
                 else:
-                    # expired — reset
                     await db.execute(
                         "UPDATE users SET is_pro = FALSE, pro_until = NULL WHERE user_id = ?",
                         (user_id,)
                     )
                     await db.commit()
 
-        # Check credits
+        # Credits check (stored in seconds)
         async with db.execute(
             "SELECT credits FROM users WHERE user_id = ?", (user_id,)
         ) as cur:
             row = await cur.fetchone()
         if row and row[0] > 0:
-            return "credits"
+            return ("credits", 0)
 
-        # Check daily free usage
+        # Daily usage
         async with db.execute(
-            "SELECT count FROM daily_usage WHERE user_id = ? AND date = ?",
+            "SELECT count, seconds FROM daily_usage WHERE user_id = ? AND date = ?",
             (user_id, today)
         ) as cur:
             row = await cur.fetchone()
-        count = row[0] if row else 0
-        if count < FREE_DAILY_LIMIT:
-            return "free_ok"
-        return "limit"
+        used_count = row[0] if row else 0
+        used_sec = row[1] if row else 0
+
+        # Count limit
+        if used_count >= FREE_DAILY_LIMIT:
+            return ("limit", 0)
+
+        # Time limit fully exhausted
+        if used_sec >= FREE_DAILY_SECONDS:
+            return ("limit", 0)
+
+        remaining_sec = FREE_DAILY_SECONDS - used_sec
+
+        # Fits within remaining free time
+        if duration_sec == 0 or used_sec + duration_sec <= FREE_DAILY_SECONDS:
+            return ("free_ok", remaining_sec)
+
+        # Partially fits — soft wall
+        return ("partial", remaining_sec)
 
 
-async def consume_access(user_id: int, access_type: str):
+async def consume_access(user_id: int, access_type: str, seconds: int = 0):
+    """
+    Deduct usage based on access type.
+    - "credits": subtract seconds from users.credits (floored at 0)
+    - "free_ok" / "partial": increment daily count and seconds
+    - "pro": no-op
+    """
     today = date.today().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         if access_type == "credits":
             await db.execute(
-                "UPDATE users SET credits = MAX(0, credits - 1) WHERE user_id = ?",
-                (user_id,)
+                "UPDATE users SET credits = MAX(0, credits - ?) WHERE user_id = ?",
+                (seconds, user_id)
             )
-        elif access_type == "free_ok":
+        elif access_type in ("free_ok", "partial"):
             await db.execute(
-                """INSERT INTO daily_usage (user_id, date, count) VALUES (?, ?, 1)
-                   ON CONFLICT(user_id, date) DO UPDATE SET count = count + 1""",
-                (user_id, today)
+                """INSERT INTO daily_usage (user_id, date, count, seconds) VALUES (?, ?, 1, ?)
+                   ON CONFLICT(user_id, date) DO UPDATE SET
+                       count = count + 1,
+                       seconds = seconds + ?""",
+                (user_id, today, seconds, seconds)
             )
         await db.commit()
 
@@ -128,11 +161,12 @@ async def activate_pro(user_id: int, days: int = 30):
         await db.commit()
 
 
-async def add_credits(user_id: int, amount: int):
+async def add_minutes(user_id: int, minutes: int):
+    """Add purchased minutes (converted to seconds) to the user's credits balance."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "UPDATE users SET credits = credits + ? WHERE user_id = ?",
-            (amount, user_id)
+            (minutes * 60, user_id)
         )
         await db.commit()
 
@@ -140,7 +174,8 @@ async def add_credits(user_id: int, amount: int):
 async def log_payment(user_id: int, charge_id: str, amount: str, currency: str, ptype: str):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT OR IGNORE INTO payments (user_id, charge_id, amount, currency, type) VALUES (?,?,?,?,?)",
+            "INSERT OR IGNORE INTO payments (user_id, charge_id, amount, currency, type) "
+            "VALUES (?,?,?,?,?)",
             (user_id, charge_id, amount, currency, ptype)
         )
         await db.commit()
@@ -177,26 +212,27 @@ async def get_user_status(user_id: int) -> dict:
         ) as cur:
             row = await cur.fetchone()
         if not row:
-            return {"is_pro": False, "pro_until": None, "credits": 0, "daily_count": 0}
+            return {
+                "is_pro": False, "pro_until": None,
+                "credits": 0, "daily_count": 0, "daily_seconds": 0
+            }
         is_pro, pro_until, credits = row
 
-        # Check if pro expired
         if is_pro and pro_until:
-            expiry = datetime.fromisoformat(pro_until)
-            if expiry <= datetime.utcnow():
+            if datetime.fromisoformat(pro_until) <= datetime.utcnow():
                 is_pro = False
                 pro_until = None
 
         async with db.execute(
-            "SELECT count FROM daily_usage WHERE user_id = ? AND date = ?",
+            "SELECT count, seconds FROM daily_usage WHERE user_id = ? AND date = ?",
             (user_id, today)
         ) as cur:
             usage_row = await cur.fetchone()
-        daily_count = usage_row[0] if usage_row else 0
 
         return {
             "is_pro": is_pro,
             "pro_until": pro_until,
-            "credits": credits,
-            "daily_count": daily_count,
+            "credits": credits,           # stored in seconds
+            "daily_count": usage_row[0] if usage_row else 0,
+            "daily_seconds": usage_row[1] if usage_row else 0,
         }

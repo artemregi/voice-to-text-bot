@@ -1,5 +1,4 @@
 import os
-import re
 import html
 import logging
 import tempfile
@@ -34,22 +33,30 @@ logger = logging.getLogger(__name__)
 groq_client = Groq(api_key=GROQ_API_KEY)
 
 
+def fmt_sec(s: int) -> str:
+    """Format seconds as M:SS."""
+    return f"{s // 60}:{s % 60:02d}"
+
+
 # ─── /start ──────────────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     await db.get_or_create_user(user.id, user.username)
 
-    status = await db.get_user_status(user.id)
-    limit = int(os.getenv("FREE_DAILY_LIMIT", "10"))
+    s = await db.get_user_status(user.id)
 
-    if status["is_pro"]:
+    if s["is_pro"]:
         status_line = "⭐ У тебя активна *Pro-подписка* — расшифровки без ограничений!"
-    elif status["credits"] > 0:
-        status_line = f"🎯 У тебя *{status['credits']} кредитов* — хватит на {status['credits']} расшифровок."
+    elif s["credits"] > 0:
+        mins = s["credits"] // 60
+        status_line = f"🎯 У тебя *{mins} мин* накопленных минут — используй когда удобно."
     else:
-        used = status["daily_count"]
-        status_line = f"🆓 Сегодня использовано *{used}/{limit}* бесплатных расшифровок."
+        used = fmt_sec(s["daily_seconds"])
+        count = s["daily_count"]
+        status_line = (
+            f"🆓 Сегодня использовано *{used} из 3:00* и *{count}/10* расшифровок."
+        )
 
     await update.message.reply_text(
         "👋 Привет!\n\n"
@@ -68,7 +75,6 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await db.get_or_create_user(user.id, user.username)
 
     s = await db.get_user_status(user.id)
-    limit = int(os.getenv("FREE_DAILY_LIMIT", "10"))
 
     if s["is_pro"] and s["pro_until"]:
         from datetime import datetime
@@ -76,16 +82,20 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         days_left = (expiry - datetime.utcnow()).days
         plan_text = f"⭐ *Pro-подписка* — осталось {days_left} дн. (до {expiry.strftime('%d.%m.%Y')})"
     elif s["credits"] > 0:
-        plan_text = f"🎯 Кредиты: *{s['credits']}* расшифровок"
+        mins = s["credits"] // 60
+        plan_text = f"🎯 Накопленные минуты: *{mins} мин* (не сгорают)"
     else:
-        plan_text = f"🆓 Бесплатный план: *{s['daily_count']}/{limit}* сегодня"
+        used = fmt_sec(s["daily_seconds"])
+        plan_text = (
+            f"🆓 Бесплатный план:\n"
+            f"   ⏱ *{used} из 3:00* минут сегодня\n"
+            f"   🔢 *{s['daily_count']}/10* расшифровок сегодня"
+        )
 
-    text = (
-        "📊 *Твой статус:*\n\n"
-        + plan_text + "\n\n"
-        "Хочешь больше? Нажми /upgrade 👇"
+    await update.message.reply_text(
+        "📊 *Твой статус:*\n\n" + plan_text + "\n\nХочешь больше? /upgrade 👇",
+        parse_mode="Markdown",
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
 
 
 # ─── /upgrade ────────────────────────────────────────────────────────────────
@@ -97,9 +107,12 @@ async def upgrade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     keyboard = payments.build_upgrade_keyboard(has_cryptobot=bool(CRYPTO_BOT_TOKEN))
     await update.message.reply_text(
         "💎 *Выбери тариф:*\n\n"
-        "⭐ *Pro — 30 дней* — безлимитные расшифровки\n"
-        "🎯 *Кредиты +30* — 30 разовых расшифровок\n"
-        "🚀 *Кредиты +150* — 150 разовых расшифровок\n\n"
+        "⭐ *Pro — 30 дней безлимита*\n"
+        "   $3 · ~$0.10 за расшифровку · в 5× дешевле Otter.ai\n\n"
+        "🎯 *Минуты +60* (не сгорают)\n"
+        "   $1 · хватит на ~2 недели обычного использования\n\n"
+        "🚀 *Минуты +300* (не сгорают)\n"
+        "   $2.50 · или возьми Pro за $3 — разница $0.50, но безлимит\n\n"
         "Выбери способ оплаты 👇",
         parse_mode="Markdown",
         reply_markup=keyboard,
@@ -114,30 +127,35 @@ async def transcribe_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     await db.get_or_create_user(user.id, user.username)
 
-    # ── Access check ──
-    access = await db.check_access(user.id)
-    if access == "limit":
-        keyboard = payments.build_upgrade_keyboard(has_cryptobot=bool(CRYPTO_BOT_TOKEN))
-        limit = int(os.getenv("FREE_DAILY_LIMIT", "10"))
-        await message.reply_text(
-            f"🔒 Использовано *{limit}/{limit}* расшифровок сегодня.\n\n"
-            "Выбери тариф для продолжения 👇",
-            parse_mode="Markdown",
-            reply_markup=keyboard,
-        )
-        return
-
-    # ── Determine file ──
+    # ── Determine file and duration ──
     if message.voice:
         file_id = message.voice.file_id
         ext = ".ogg"
+        duration = message.voice.duration or 0
     elif message.audio:
         file_id = message.audio.file_id
         ext = "." + (message.audio.mime_type.split("/")[-1] if message.audio.mime_type else "mp3")
+        duration = message.audio.duration or 0
     elif message.video_note:
         file_id = message.video_note.file_id
         ext = ".mp4"
+        duration = message.video_note.duration or 0
     else:
+        return
+
+    # ── Access check with duration ──
+    access, remaining_sec = await db.check_access(user.id, duration_sec=duration)
+
+    if access == "limit":
+        s = await db.get_user_status(user.id)
+        keyboard = payments.build_upgrade_keyboard(has_cryptobot=bool(CRYPTO_BOT_TOKEN))
+        await message.reply_text(
+            f"🔒 Исчерпан лимит на сегодня — *{fmt_sec(s['daily_seconds'])} из 3:00* "
+            f"и *{s['daily_count']}/10* расшифровок.\n\n"
+            "Pro открывает безлимит за $3/мес 👇",
+            parse_mode="Markdown",
+            reply_markup=keyboard,
+        )
         return
 
     status_msg = await message.reply_text("⏳ Расшифровываю...")
@@ -164,31 +182,77 @@ async def transcribe_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await status_msg.edit_text("🤷 Не удалось распознать речь. Попробуй ещё раз.")
             return
 
-        # ── Consume access after successful transcription ──
-        await db.consume_access(user.id, access)
+        # ── Partial: soft wall — show proportional text, hide the rest ──
+        if access == "partial":
+            fraction = remaining_sec / max(duration, 1)
+            words = text.split()
+            visible_count = max(20, int(len(words) * fraction))
+            visible_text = " ".join(words[:visible_count])
+            hidden_count = len(words) - visible_count
 
-        logger.info(f"Transcribed {len(text)} chars from user {user.id} (access={access})")
+            await db.consume_access(user.id, "partial", seconds=remaining_sec)
+            logger.info(
+                f"Partial transcription: user={user.id}, shown={visible_count}/{len(words)} words, "
+                f"remaining={remaining_sec}s, duration={duration}s"
+            )
 
-        # ── Format and send ──
+            escaped = html.escape(visible_text)
+            await status_msg.edit_text(
+                f"📝 Расшифровка (начало):\n\n<code>{escaped}</code>",
+                parse_mode="HTML",
+            )
+
+            keyboard = payments.build_upgrade_keyboard(has_cryptobot=bool(CRYPTO_BOT_TOKEN))
+            await message.reply_text(
+                f"🔒 Ещё ~{hidden_count} слов скрыто — исчерпан лимит 3 мин/день.\n\n"
+                f"Pro — безлимит за $3/мес 👇",
+                reply_markup=keyboard,
+            )
+            return
+
+        # ── Full transcription (free_ok, pro, credits) ──
+        consume_seconds = duration if access != "pro" else 0
+        await db.consume_access(user.id, access, seconds=consume_seconds)
+
+        logger.info(f"Transcribed {len(text)} chars, user={user.id}, access={access}, dur={duration}s")
+
+        # Format and send (with chunking for long texts)
         escaped = html.escape(text)
         OPEN, CLOSE = "<code>", "</code>"
         TAG_LEN = len(OPEN) + len(CLOSE)
         header = "📝 Расшифровка:\n\n"
 
         chunks = []
-        remaining = escaped
+        remaining_text = escaped
         first = True
-        while remaining:
+        while remaining_text:
             prefix = header if first else ""
             available = 4096 - len(prefix) - TAG_LEN
-            chunk = remaining[:available]
+            chunk = remaining_text[:available]
             chunks.append(prefix + OPEN + chunk + CLOSE)
-            remaining = remaining[available:]
+            remaining_text = remaining_text[available:]
             first = False
 
         await status_msg.edit_text(chunks[0], parse_mode="HTML")
         for chunk in chunks[1:]:
             await message.reply_text(chunk, parse_mode="HTML")
+
+        # ── Progress footer for free users ──
+        if access == "free_ok":
+            s = await db.get_user_status(user.id)
+            used_now = s["daily_seconds"]
+            pct = used_now / db.FREE_DAILY_SECONDS
+
+            if pct >= 0.8:
+                left = db.FREE_DAILY_SECONDS - used_now
+                await message.reply_text(
+                    f"⚠️ Осталось ~{fmt_sec(left)} бесплатного времени сегодня.\n"
+                    f"Pro — безлимит за $3/мес → /upgrade"
+                )
+            elif pct >= 0.4:
+                await message.reply_text(
+                    f"▸ {fmt_sec(used_now)} из 3:00 использовано сегодня"
+                )
 
     except Exception as e:
         logger.error(f"Transcription error: {e}")
@@ -208,8 +272,7 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     query = update.callback_query
     await query.answer()
 
-    data = query.data  # e.g. "stars_sub", "crypto_c30"
-    parts = data.split("_", 1)
+    parts = query.data.split("_", 1)
     if len(parts) != 2:
         return
     method, plan_key = parts
@@ -228,7 +291,9 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         pay_url = await payments.create_crypto_invoice(query.from_user.id, plan_key)
         if pay_url:
             plan = payments.PLANS[plan_key]
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("💰 Оплатить в @CryptoBot", url=pay_url)]])
+            kb = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("💰 Оплатить в @CryptoBot", url=pay_url)]]
+            )
             await query.message.reply_text(
                 f"💳 *{plan['title']}* — {plan['usdt']} USDT\n\n"
                 "Нажми кнопку ниже для оплаты. После оплаты доступ откроется автоматически ✅",
@@ -242,8 +307,7 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # ─── Telegram Stars handlers ──────────────────────────────────────────────────
 
 async def pre_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.pre_checkout_query
-    await query.answer(ok=True)
+    await update.pre_checkout_query.answer(ok=True)
 
 
 # ─── main ─────────────────────────────────────────────────────────────────────
@@ -259,22 +323,18 @@ def main() -> None:
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("upgrade", upgrade_cmd))
 
-    # Media
     app.add_handler(MessageHandler(filters.VOICE, transcribe_voice))
     app.add_handler(MessageHandler(filters.AUDIO, transcribe_voice))
     app.add_handler(MessageHandler(filters.VIDEO_NOTE, transcribe_voice))
 
-    # Payments
-    app.add_handler(CallbackQueryHandler(buy_callback, pattern=r"^(stars|crypto)_(sub|c30|c150)$"))
+    app.add_handler(CallbackQueryHandler(buy_callback, pattern=r"^(stars|crypto)_(sub|m60|m300)$"))
     app.add_handler(PreCheckoutQueryHandler(pre_checkout))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, payments.handle_successful_payment))
 
-    # CryptoBot polling job (every 5 seconds)
     if CRYPTO_BOT_TOKEN:
         app.job_queue.run_repeating(payments.check_crypto_invoices, interval=5, first=5)
         logger.info("CryptoBot polling enabled")
