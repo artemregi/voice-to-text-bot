@@ -212,7 +212,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             "💰 *Твой бонус (35%) с каждой покупки реферала:*\n"
             "   • Купит Pro ($3) → тебе *+63 мин*\n"
             "   • Купит 60 мин ($1) → тебе *+21 мин*\n"
-            "   • Купит 300 мин ($2.50) → тебе *+105 мин*\n\n"
+            "   • Купит 300 мин ($2.50) → тебе *+52 мин*\n\n"
             f"👥 Приглашено: *{stats['referrals']} чел.*\n"
             f"🎁 Заработано всего: *{stats['earned_minutes']} мин*",
             parse_mode="Markdown",

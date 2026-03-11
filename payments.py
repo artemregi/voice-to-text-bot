@@ -38,7 +38,7 @@ PLANS = {
         "usdt": "2.50",
         "minutes": 300,
         "days": None,
-        "partner_bonus_min": 105,  # 35% of 300 min
+        "partner_bonus_min": 52,   # 35% of $2.50 → $0.875 → ~52 min
     },
 }
 
